@@ -1,164 +1,223 @@
-# report_builder.py
-
-from datetime import datetime
-from collections import defaultdict
-
+from datetime import date
+from typing import List, Any
 from docx import Document
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_ORIENT, WD_SECTION
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.enum.section import WD_SECTION
 
-from table_utils import (
+from your_utils import (
     _compute_column_widths,
-    _set_cell_background,
-    add_mini_table_to_cell,
-    style_paragraph,
-    add_justified_text,
-    add_global_page_numbers
+    format_date,
+    add_header,
+    add_footer,
+    insert_table_of_contents,
+    build_executive_summary
 )
-from html_parser import parse_html_content
+from table_utils import style_table, add_mini_table_to_cell
+from html_parser import clean_html_and_extract_tables
+from http_client import ProjectMeta, Issue
+from html2docx import html2docx
 
 
-def create_word_report(table_data, region_filter):
-    doc = Document()
+class ReportBuilder:
+    def __init__(self, meta: ProjectMeta, issues: List[Issue], report_date: date):
+        self.meta = meta
+        self.issues = issues
+        self.report_date = report_date
+        self.doc = Document()
 
-    # ── Page Setup ────────────────────────────────────────────
-    sect0 = doc.sections[0]
-    sect0.orientation = WD_ORIENT.LANDSCAPE
-    sect0.page_width, sect0.page_height = Inches(11), Inches(8.5)
-    for sect in doc.sections:
-        sect.top_margin = sect.bottom_margin = sect.left_margin = sect.right_margin = Inches(0.5)
+    def init_styles(self):
+        sect = self.doc.sections[0]
+        sect.page_width, sect.page_height = Inches(11), Inches(8.5)
+        for m in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
+            setattr(sect, m, Inches(0.5))
 
-    # ── Styles ─────────────────────────────────────────────────
-    normal = doc.styles["Normal"]
-    normal.font.name, normal.font.size = "Calibri", Pt(11)
-    h1 = doc.styles["Heading 1"]
-    h1.font.name, h1.font.size, h1.font.color.rgb = "Calibri", Pt(16), RGBColor.from_string("107AB8")
-    h2 = doc.styles["Heading 2"]
-    h2.font.name, h2.font.size, h2.font.color.rgb = "Calibri", Pt(13), RGBColor.from_string("EF6149")
+        styles = self.doc.styles
+        normal = styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(11)
+        for lvl, size in (("Heading 1", 16), ("Heading 2", 14), ("Heading 3", 12)):
+            h = styles[lvl]
+            h.font.name = "Calibri"
+            h.font.size = Pt(size)
 
-    # ── Cover Page ────────────────────────────────────────────
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("Regional Issues Report\n")
-    r.font.size, r.font.color.rgb = Pt(24), RGBColor.from_string("107AB8")
-    doc.add_paragraph("Mini Group / Eleven Degrees Consulting").alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph(f"Date: {datetime.today():%Y-%m-%d}").alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_page_break()
+    def build_cover_page(self):
+        p = self.doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run("Regional Issues Report\n")
+        run.font.size = Pt(28)
 
-    # ── Footer (region + page numbers) ────────────────────────
-    add_global_page_numbers(doc)
-    for sec in doc.sections:
-        ftr = sec.footer
-        # insert region line above page numbers
-        p_reg = ftr.add_paragraph(f"Regional Issues Report for “{(region_filter or 'ALL').upper()}”")
-        p_reg.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_reg.runs[0].font.name, p_reg.runs[0].font.size = "Calibri", Pt(9)
+        for txt in (
+            "Mini Group / Eleven Degrees Consulting",
+            f"Project: {self.meta.name}",
+            f"Region: {self.meta.region}",
+            f"Date: {format_date(self.report_date)}",
+        ):
+            self.doc.add_paragraph(txt).alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # ── Group by Project ───────────────────────────────────────
-    grouped = defaultdict(list)
-    for row in table_data:
-        grouped[row[0]].append(row)
+        self.doc.add_page_break()
 
-    first = True
-    for pid, rows in grouped.items():
-        proj = rows[0]
-        name, branch, region, start, status = proj[1], proj[2], proj[3], proj[4], proj[5]
-        bm, om, sup = proj[14], proj[15], proj[16]
+    def build_toc_and_summary(self):
+        insert_table_of_contents(self.doc, levels=2)
+        self.doc.add_page_break()
+        build_executive_summary(self.doc, self.issues)
 
-        # New section per project
-        if not first:
-            section = doc.add_section(WD_SECTION.NEW_PAGE)
-        else:
-            section = doc.sections[0]
-            first = False
+    def _region_key(self, raw_region: Any) -> str:
+        if isinstance(raw_region, (list, tuple)):
+            for v in raw_region:
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return "UNKNOWN"
+        if isinstance(raw_region, str) and raw_region.strip():
+            return raw_region.strip()
+        return "UNKNOWN"
 
-        # ─ Header (logos + metadata) ────────────────────────────
-        header = section.header
-        header.is_linked_to_previous = False
-        for p in list(header.paragraphs):
-            header._element.remove(p._element)
+    def build_sections(self):
+        groups: dict[str, List[Issue]] = {}
 
-        logo_tbl = header.add_table(rows=1, cols=2, width=Inches(11))
-        logo_tbl.autofit = False
-        logo_tbl.columns[0].width = logo_tbl.columns[1].width = Inches(5.5)
+        for issue in self.issues:
+            key = self._region_key(issue.region)
+            groups.setdefault(key, []).append(issue)
 
-        # left logo
-        c0 = logo_tbl.cell(0, 0)
-        c0.vertical_alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p0 = c0.paragraphs[0]; p0.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        try: p0.add_run().add_picture("minigroup_logo.png", width=Inches(1.2))
-        except: pass
+        for idx, (branch, branch_issues) in enumerate(groups.items()):
+            if idx > 0:
+                self.doc.add_section(WD_SECTION.NEW_PAGE)
 
-        # right logo
-        c1 = logo_tbl.cell(0, 1)
-        c1.vertical_alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p1 = c1.paragraphs[0]; p1.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        try: p1.add_run().add_picture("minigroup.png", width=Inches(1.2))
-        except: pass
+            add_header(
+                self.doc,
+                left_text="minigroup_logo.png",
+                center_text=f"{self.meta.name} – {branch}",
+                right_text="minigroup.png"
+            )
 
-        # metadata line
-        meta = (f"Branch: {branch} | Region: {region} | Start: {start} | "
-                f"Status: {status} | BM: {bm} | OM: {om} | Sup: {sup}")
-        mp = header.add_paragraph(meta)
-        mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        mp.runs[0].font.name, mp.runs[0].runs[0].font.size = "Calibri", Pt(9)
+            self.doc.add_heading(f"Branch: {branch}", level=1)
 
-        # ── Body: Project Info ───────────────────────────────────
-        doc.add_heading(f"Project: {name}", level=1)
-        for label, val in [
-            ("Branch", branch), ("Region", region), ("Start Date", start),
-            ("Status", status), ("Branch Manager", bm),
-            ("Operations Manager", om), ("Supervisor", sup)
-        ]:
-            p = doc.add_paragraph()
-            run = p.add_run(f"{label}: "); run.bold = True
-            p.add_run(str(val))
-        doc.add_paragraph()
-
-        # ── Issues ──────────────────────────────────────────────
-        for issue in rows:
-            title, sev = issue[6], issue[7]
-            doc.add_heading(f"Issue: {title}", level=2)
-
-            # 1) Short metadata grid
-            meta_fields = [("Severity", sev), ("Cost Impact", f"${issue[10]:,.2f}")]
-            tbl_meta = doc.add_table(rows=len(meta_fields), cols=2)
-            tbl_meta.autofit = False
-            widths = _compute_column_widths(meta_fields, max_total_width_inches=Inches(6).inches)
-            for i, w in enumerate(widths):
-                for cell in tbl_meta.columns[i].cells:
-                    cell.width = w
-            for i, (lbl, val) in enumerate(meta_fields):
-                c0, c1 = tbl_meta.rows[i].cells
-                c0.text = lbl; c0.paragraphs[0].runs[0].bold = True
-                c1.text = str(val)
-            doc.add_paragraph()
-
-            # 2) Long text sections with HTML parsing
-            for lbl, html in [
-                ("Description", issue[8]),
-                ("Implication", issue[9]),
-                ("Recommendation", issue[13])
+            for label, val in [
+                ("Start Date", self.meta.start_date),
+                ("Status", self.meta.status),
+                ("Branch Manager", self.meta.bm),
+                ("Operations Manager", self.meta.om),
+                ("Supervisor", self.meta.sup),
             ]:
-                doc.add_heading(lbl, level=3)
-                cont = doc.add_table(rows=1, cols=1).cell(0,0)
-                cont.width = Inches(10)
-                for block in parse_html_content(html):
-                    if block["type"] == "paragraph":
-                        p = cont.add_paragraph()
-                        style_paragraph(p)
-                        for run in block["runs"]:
-                            r = p.add_run(run["text"])
-                            r.bold = run["bold"]
-                            r.italic = run["italic"]
-                            if run.get("href"):
-                                # optional hyperlink logic here
-                                pass
-                    else:  # nested table block
-                        add_mini_table_to_cell(cont, [h for h in block["rows"][0]], block["rows"][1:])
-                doc.add_paragraph()
+                if val:
+                    p = self.doc.add_paragraph()
+                    p.add_run(f"{label}: ").bold = True
+                    p.add_run(str(val))
+            self.doc.add_paragraph()
 
-    return doc
+            for issue in branch_issues:
+                self._render_issue(issue)
+
+    def _render_issue(self, issue: Issue):
+        self.doc.add_heading(f"Issue: {issue.title}", level=2)
+
+        # 🔍 Log raw HTML presence of <table>
+        print(f"\n[DEBUG] Issue '{issue.title}': Raw HTML contains table?")
+        for label, html in [
+            ("Description", issue.description_html),
+            ("Recommendation", issue.recommendation or ""),
+            ("Mgmt Comment 1", issue.mgmt_comment1 or ""),
+            ("Mgmt Comment 2", issue.mgmt_comment2 or ""),
+            ("Additional Table", issue.table_html or "")
+        ]:
+            contains_table = "<table" in html.lower()
+            print(f"  - {label}: {'✅ Table found' if contains_table else '❌ No table'}")
+
+        # ✅ Use raw HTML tables only for Description
+        desc_text, desc_tables = clean_html_and_extract_tables(issue.description_html, preserve_tables_as_html=True)
+        recomm_text, recomm_tables = clean_html_and_extract_tables(issue.recommendation or "")
+        mgmt1_text, mgmt1_tables = clean_html_and_extract_tables(issue.mgmt_comment1 or "")
+        mgmt2_text, mgmt2_tables = clean_html_and_extract_tables(issue.mgmt_comment2 or "")
+        table_text, table_tables = clean_html_and_extract_tables(issue.table_html or "")
+        implication = issue.implication or ""
+        cost = f"${issue.cost_impact:,.2f}"
+
+        print(f"[DEBUG] Issue '{issue.title}':")
+        print(f"  - Description tables: {len(desc_tables)}")
+        print(f"  - Recommendation tables: {len(recomm_tables)}")
+        print(f"  - Mgmt Comment 1 tables: {len(mgmt1_tables)}")
+        print(f"  - Mgmt Comment 2 tables: {len(mgmt2_tables)}")
+        print(f"  - Additional tables: {len(table_tables)}")
+
+        fields = [
+            ("Issue Title", issue.title, []),
+            ("Severity", issue.severity.capitalize(), []),
+            ("Description", desc_text, desc_tables),  # raw HTML tables
+            ("Implication", implication, []),
+            ("Cost Impact", cost, []),
+            ("Mgmt Comment 1", mgmt1_text, mgmt1_tables),
+            ("Mgmt Comment 2", mgmt2_text, mgmt2_tables),
+            ("Recommendation", recomm_text, recomm_tables),
+            ("Additional Table", table_text, table_tables),
+        ]
+
+        # Build table in Word
+        tbl = self.doc.add_table(rows=len(fields), cols=2)
+        tbl.style = "Table Grid"
+        tbl.autofit = False
+
+        widths = _compute_column_widths(
+            [[label, text] for label, text, _ in fields],
+            max_total_width_inches=Inches(10).inches
+        )
+        tbl.columns[0].width = widths[0]
+        tbl.columns[1].width = widths[1]
+
+        for i, (label, text, tables) in enumerate(fields):
+            left, right = tbl.rows[i].cells
+
+            # Label cell
+            left.text = label
+            if left.paragraphs and left.paragraphs[0].runs:
+                left.paragraphs[0].runs[0].bold = True
+
+            # Clear right cell
+            for p in list(right.paragraphs):
+                p._element.getparent().remove(p._element)
+
+            # Add main text
+            right.add_paragraph(text or "")
+
+            # ⬇️ Handle tables for Description field differently
+            if label == "Description":
+                for raw_html in tables:
+                    temp_doc = Document()
+                    html2docx(raw_html, temp_doc)
+                    for para in temp_doc.paragraphs:
+                        right._element.append(para._element)
+                    for tbl in temp_doc.tables:
+                        right._element.append(tbl._element)
+            else:
+                # Normal parsed tables
+                for headers, rows in tables:
+                    print(f"    ➤ Rendering table in '{label}' with headers: {headers} and {len(rows)} rows")
+                    add_mini_table_to_cell(right, headers, rows)
+
+        self.doc.add_paragraph()  # spacing after issue
+
+
+
+    def build(self, output_path=None):
+        self.init_styles()
+        self.build_cover_page()
+        self.build_toc_and_summary()
+        self.build_sections()
+        #self.build_footer()
+        if output_path:
+            self.doc.save(output_path)
+            print(f"✅ Report saved to {output_path}")
+        else:
+            self.save()
+
+    def build_footer(self):
+        # Add footer with region and page number
+        self.doc.sections[0].footer.is_linked_to_previous = False
+        self.doc.sections[0].footer.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Add left and right footer text
+        self.doc.sections[0].footer.paragraphs[0].add_run(
+            f"Regional Issues Report – {self.meta.region} | "
+        ).bold = True
+        self.doc.sections[0].footer.paragraphs[0].add_run("Page ")
+        self.doc.sections[0].footer.paragraphs[0].add_run().add_field("PAGE")
+ 

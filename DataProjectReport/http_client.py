@@ -1,146 +1,188 @@
 # http_client.py
 
-import os
+import os, json, logging
 from pathlib import Path
-from dotenv import load_dotenv
-
-# 1️⃣ Locate your .env (project root)
-base_dir = Path(__file__).parent.resolve()
-env_path = base_dir / ".env"
-
-# 2️⃣ Load environment variables
-load_dotenv(dotenv_path=env_path)
-
-import logging
-from datetime import datetime, date
+from datetime import date
+from typing import Iterator, Dict, Any, List, Optional
 from urllib.parse import urljoin
+from dataclasses import dataclass, field
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from dotenv import load_dotenv
 
-# ─── Configuration ───────────────────────────────────────────
-API_TOKEN      = os.getenv("API_TOKEN", "")
-BASE_URL       = os.getenv("BASE_URL", "https://apis-eu.highbond.com/v1/orgs/48414")
-PAGE_SIZE      = int(os.getenv("PAGE_SIZE", "100"))
-HTTP_TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "10"))
-RETRY_TOTAL    = int(os.getenv("RETRY_TOTAL", "5"))
-RETRY_BACKOFF  = float(os.getenv("RETRY_BACKOFF", "1"))
+# ─── Load .env ──────────────────────────────────────────
+_base = Path(__file__).parent
+load_dotenv(_base / ".env")
 
-if not API_TOKEN:
-    raise RuntimeError("Missing API_TOKEN in environment")
+API_TOKEN = os.getenv("API_TOKEN")
+BASE_URL  = os.getenv("BASE_URL")
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
+TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "10"))
+
+if not API_TOKEN or not BASE_URL:
+    raise RuntimeError("❌ Missing API_TOKEN or BASE_URL in .env")
+
 HEADERS = {
     "Authorization": f"Bearer {API_TOKEN}",
-    "Content-Type": "application/vnd.api+json"
+    "Content-Type":  "application/vnd.api+json"
 }
 
-# ─── Logger ──────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+CACHE_DIR = _base / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
-# ─── Sync HTTP Client with Retry ────────────────────────────
-def build_sync_session() -> requests.Session:
+# ─── Data models ──────────────────────────────────────
+@dataclass
+class ProjectMeta:
+    id: str
+    name: str
+    start_date: date
+    end_date: Optional[date]
+    region: Optional[str]
+    bm: Optional[str] = None
+    om: Optional[str] = None
+    sup: Optional[str] = None
+    status: Optional[str] = None
+    contacts: List[str] = field(default_factory=list)
+
+@dataclass
+class Issue:
+    id: str
+    title: str
+    severity: str
+    region: str
+    description_html: str
+    implication: Optional[str]
+    cost_impact: float
+    mgmt_comment1: Optional[str]
+    mgmt_comment2: Optional[str]
+    table_html: Optional[str]
+    recommendation: Optional[str] = None
+
+# ─── Helpers ──────────────────────────────────────────
+def normalize(value, default="") -> str:
+    if isinstance(value, list):
+        value = value[0] if value else default
+    return value.strip() if isinstance(value, str) else default
+
+def _get_with_retries(url: str, params: dict = None) -> Dict[str, Any]:
     session = requests.Session()
-    retries = Retry(
-        total=RETRY_TOTAL,
-        backoff_factor=RETRY_BACKOFF,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[429,500,502,503,504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    session.mount('http://',  HTTPAdapter(max_retries=retries))
+    resp = session.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
-sync_session = build_sync_session()
-
-
-def get_all_projects() -> list[dict]:
-    """
-    Fetch all projects whose start_date <= today.
-    - paginated (page[size], page[number])
-    - retries built-in
-    - drops any that slipped future-dated
-    """
-    today_str = date.today().isoformat()
-    url = f"{BASE_URL}/projects"
-    page = 1
-    params = {
-        "filter[start_date][lte]": today_str,
-        "page[size]": PAGE_SIZE,
-        "page[number]": page
-    }
-    all_projects = []
-
+def paginate(endpoint: str, params: dict) -> Iterator[Dict[str, Any]]:
+    url = f"{BASE_URL}{endpoint}"
     while True:
-        try:
-            resp = sync_session.get(url, headers=HEADERS, params=params, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"❌ get_all_projects: failed page {page}: {e}")
-            break
-
-        body = resp.json()
-        batch = body.get("data", [])
-        all_projects.extend(batch)
-
-        next_link = body.get("links", {}).get("next")
+        data = _get_with_retries(url, params=params)
+        yield from data.get("data", [])
+        next_link = data.get("links", {}).get("next")
         if not next_link:
             break
-
         url = urljoin(BASE_URL, next_link)
         params = None
-        page += 1
 
-    # Final client-side filter
-    filtered = []
-    for p in all_projects:
-        sd = p.get("attributes", {}).get("start_date", "")
+# ─── Fetch projects ───────────────────────────────────
+def get_all_projects() -> List[ProjectMeta]:
+    today = date.today().isoformat()
+    params = {"filter[start_date][lte]": today, "page[size]": PAGE_SIZE}
+    result: List[ProjectMeta] = []
+
+    for item in paginate("/projects", params):
+        attr = item.get("attributes", {})
+        ca   = attr.get("custom_attributes", [])
         try:
-            if datetime.strptime(sd, "%Y-%m-%d").date() <= date.today():
-                filtered.append(p)
-        except ValueError:
+            start = date.fromisoformat(attr.get("start_date"))
+        except:
+            continue
+        end = None
+        if attr.get("end_date"):
+            try:
+                end = date.fromisoformat(attr["end_date"])
+            except:
+                pass
+
+        def extract(term: str) -> str:
+            return normalize(next((c["value"] for c in ca if c.get("term")==term), ""))
+
+        pm = ProjectMeta(
+            id         = item.get("id",""),
+            name       = attr.get("name",""),
+            start_date = start,
+            end_date   = end,
+            region     = extract("Region"),
+            bm         = extract("Branch Manager"),
+            om         = extract("Operations Manager"),
+            sup        = extract("Supervisor"),
+            status     = attr.get("status","Active"),
+            contacts   = []
+        )
+        pm.contacts = [pm.bm, pm.om, pm.sup]
+        result.append(pm)
+
+    return result
+
+# ─── Fetch issues ─────────────────────────────────────
+def get_project_issues(
+    project_id: str,
+    severity: Optional[List[str]] = None,
+    use_cache: bool = True
+) -> List[Issue]:
+    cache_file = CACHE_DIR / f"{project_id}_issues.json"
+    items = []
+
+    # 1) Fetch or fallback to cache
+    try:
+        data = _get_with_retries(f"{BASE_URL}/projects/{project_id}/issues")
+        items = data.get("data", [])
+        if use_cache:
+            cache_file.write_text(json.dumps(items))
+    except Exception as e:
+        logger.warning(f"⚠️ API failed, using cache: {e}")
+        if cache_file.exists():
+            items = json.loads(cache_file.read_text())
+        else:
+            return []
+
+    filtered: List[Issue] = []
+    for itm in items:
+        ia = itm.get("attributes", {})
+        if not isinstance(ia, dict):
             continue
 
-    logger.info(f"✅ get_all_projects: retrieved {len(filtered)} projects (up to {today_str})")
+        cm = {c["term"]: c["value"] for c in ia.get("custom_attributes", [])}
+
+        # Region & severity
+        region = normalize(cm.get("Region",""))
+        sev    = normalize(ia.get("severity","")).lower()
+        if severity and sev not in [s.lower() for s in severity]:
+            continue
+
+        # Raw HTML fields
+        desc_html = ia.get("description","") or ""
+        rec_html  = ia.get("recommendation","") or ""
+        mg1       = cm.get("Management Comments 1","") or ""
+        mg2       = cm.get("Management Comments 2","") or ""
+        tbl_html  = cm.get("Table Details","") or ""
+
+        issue = Issue(
+            id               = itm.get("id",""),
+            title            = ia.get("title","") or "",
+            severity         = sev,
+            region           = region,
+            description_html = desc_html,
+            implication      = ia.get("effect","") or "",
+            cost_impact      = float(ia.get("cost_impact") or 0),
+            mgmt_comment1    = mg1,
+            mgmt_comment2    = mg2,
+            table_html       = tbl_html,
+            recommendation   = rec_html
+        )
+        filtered.append(issue)
+
     return filtered
-
-
-def get_project_issues(project_id: str) -> list[dict]:
-    """
-    Fetch all issues for a given project_id.
-    Returns empty list on any error.
-    """
-    url = f"{BASE_URL}/projects/{project_id}/issues"
-    try:
-        resp = sync_session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        logger.debug(f"Fetched {len(data)} issues for project {project_id}")
-        return data
-    except Exception as e:
-        logger.error(f"❌ get_project_issues [{project_id}]: {e}")
-        return []
-
-
-# ─── Async HTTP Client Skeleton ─────────────────────────────
-# Use this as a starting point if you later need full parallel fetch.
-#
-# import httpx, asyncio
-#
-# class AsyncHighBondClient:
-#     def __init__(self):
-#         token = os.getenv("API_TOKEN")
-#         self.base_url = os.getenv("BASE_URL")
-#         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.api+json"}
-#         self.client = httpx.AsyncClient(headers=self.headers, timeout=HTTP_TIMEOUT)
-#
-#     async def get_all_projects(self):
-#         # similar pagination logic, but using await self.client.get(...)
-#         pass
-#
-#     async def get_project_issues(self, project_id):
-#         # parallelizable with asyncio.gather
-#         pass
-#
-#     async def close(self):
-#         await self.client.aclose()
