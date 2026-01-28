@@ -46,4 +46,3 @@ The provided notebooks come with detailed instructions, and some labs are supple
 ## Notes
 
 Some content is currently being updated. It will be uploaded soon.
-For any inquiry or assistance, email: eee.asifnewaz@iut-dhaka.edu
